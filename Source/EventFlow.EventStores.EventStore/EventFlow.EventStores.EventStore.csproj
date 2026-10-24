@@ -22,7 +22,7 @@
   </PropertyGroup>
    
   <ItemGroup>
-    <PackageReference Include="EventStore.Client" Version="5.0.1" />
+    <PackageReference Include="EventStore.Client" Version="5.0.12" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.0.0" PrivateAssets="All" />
   </ItemGroup>
 
