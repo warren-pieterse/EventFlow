@@ -25,6 +25,12 @@ shared suite on a fresh database for each run; its first-page assertions assume
 that earlier runs have not filled the first 200 events. Run the cleanup command
 after tests, including when a test fails.
 
+Append retry tests inject deadline failures before a real server append and after
+a successful append whose acknowledgement is lost. They verify idempotent recovery,
+a rival command winning the revision, bounded attempts, unchanged batches and
+cancellation during backoff. Production transport behaviour is unchanged except
+for the explicit per-attempt deadline and retry policy.
+
 Tests cover aggregate appends/reads, optimistic concurrency, global pagination,
 checkpoint boundaries, system-stream gaps, cancellation, and soft deletion.
 Registration tests cover adapter selection, singleton sharing across scopes,
@@ -124,3 +130,9 @@ Validation on 2026-10-24: all 70 tests passed for the net48 target on .NET
 Framework 4.8.1 (runtime 4.8.10008.0), Windows build 26300, over TLS. No tests
 were skipped. This includes the unchanged shared EventFlow suite and real TCP
 protocol-migration tests.
+
+Validation on 2026-10-26: all 82 tests passed on both net8.0 and net48, with
+zero skipped tests, using isolated KurrentDB 26.1.1 and EventStoreDB 23.10.8
+databases. The strengthened multi-event lost-acknowledgement cases also passed
+on both targets. The new tests simulate failures at the append boundary; they
+do not attempt to induce actual network packet loss.

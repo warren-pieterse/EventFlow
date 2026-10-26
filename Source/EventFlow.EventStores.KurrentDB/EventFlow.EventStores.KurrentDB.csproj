@@ -24,6 +24,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="EventFlow.EventStores.KurrentDB.Tests" />
     <None Include="README.md" Pack="true" PackagePath="\" />
     <PackageReference Include="KurrentDB.Client" Version="1.6.0" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.0.0" PrivateAssets="All" />

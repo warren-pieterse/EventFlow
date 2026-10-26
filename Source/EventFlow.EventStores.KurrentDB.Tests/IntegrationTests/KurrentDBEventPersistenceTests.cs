@@ -383,6 +383,68 @@ namespace EventFlow.EventStores.KurrentDB.Tests.IntegrationTests
                 }
             }
         }
+        [TestCase(1)]
+        [TestCase(2)]
+        public async Task LostAppendAcknowledgementDoesNotDuplicateEvents(int sequenceNumber)
+        {
+            if (sequenceNumber > 1)
+                await _persistence.CommitEventsAsync(_id, new[] { CreateEvent(1) }, _timeout.Token);
+
+            var attempts = 0;
+            var persistence = new KurrentDBEventPersistence(new NullLog(), _client, async (stream, state, events, token) =>
+            {
+                await _client.AppendToStreamAsync(stream, state, events,
+                    configureOperationOptions: options => options.ThrowOnAppendFailure = true, cancellationToken: token);
+                if (++attempts == 1)
+                    throw new Grpc.Core.RpcException(new Grpc.Core.Status(Grpc.Core.StatusCode.DeadlineExceeded, "acknowledgement lost after commit"));
+            });
+            var serialized = new[] { CreateEvent(sequenceNumber), CreateEvent(sequenceNumber + 1) };
+            var committed = await persistence.CommitEventsAsync(_id, serialized, _timeout.Token);
+            Assert.That(attempts, Is.EqualTo(2));
+            Assert.That(committed.Count, Is.EqualTo(2));
+            for (var i = 0; i < serialized.Length; i++) AssertEvent(committed.ElementAt(i), serialized[i]);
+            var stored = await ReadRawEvents();
+            Assert.That(stored.Length, Is.EqualTo(sequenceNumber + 1));
+            Assert.That(stored.Last().Event.Data.ToArray(), Is.EqualTo(Encoding.UTF8.GetBytes(serialized.Last().SerializedData)));
+        }
+
+        [Test]
+        public async Task TimeoutBeforeServerCommitRetriesTheWrite()
+        {
+            var attempts = 0;
+            var persistence = new KurrentDBEventPersistence(new NullLog(), _client, async (stream, state, events, token) =>
+            {
+                if (++attempts == 1)
+                    throw new Grpc.Core.RpcException(new Grpc.Core.Status(Grpc.Core.StatusCode.DeadlineExceeded, "timeout before commit"));
+                await _client.AppendToStreamAsync(stream, state, events,
+                    configureOperationOptions: options => options.ThrowOnAppendFailure = true, cancellationToken: token);
+            });
+            await persistence.CommitEventsAsync(_id, new[] { CreateEvent(1) }, _timeout.Token);
+            Assert.That(attempts, Is.EqualTo(2));
+            Assert.That((await ReadRawEvents()).Length, Is.EqualTo(1));
+        }
+
+        [Test]
+        public async Task RivalWriteAfterTimeoutRemainsAConcurrencyConflict()
+        {
+            var attempts = 0;
+            var persistence = new KurrentDBEventPersistence(new NullLog(), _client, async (stream, state, events, token) =>
+            {
+                if (++attempts == 1)
+                {
+                    // Another command wins the revision before this command retries.
+                    await _persistence.CommitEventsAsync(_id, new[] { CreateEvent(1) }, token);
+                    throw new Grpc.Core.RpcException(new Grpc.Core.Status(Grpc.Core.StatusCode.DeadlineExceeded, "timeout before retry"));
+                }
+                await _client.AppendToStreamAsync(stream, state, events,
+                    configureOperationOptions: options => options.ThrowOnAppendFailure = true, cancellationToken: token);
+            });
+            var exception = Assert.ThrowsAsync<OptimisticConcurrencyException>(async () =>
+                await persistence.CommitEventsAsync(_id, new[] { CreateEvent(1) }, _timeout.Token));
+            Assert.That(exception.InnerException, Is.TypeOf<WrongExpectedVersionException>());
+            Assert.That(attempts, Is.EqualTo(2));
+            Assert.That((await ReadRawEvents()).Length, Is.EqualTo(1));
+        }
         private static SerializedEvent CreateEvent(int sequenceNumber)
         {
             var metadata = new Metadata

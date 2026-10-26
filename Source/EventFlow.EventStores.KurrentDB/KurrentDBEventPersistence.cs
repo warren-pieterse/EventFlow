@@ -30,12 +30,16 @@ using System.Threading.Tasks;
 using EventFlow.Core;
 using EventFlow.Exceptions;
 using EventFlow.Logs;
+using Grpc.Core;
 using KurrentDB.Client;
 
 namespace EventFlow.EventStores.KurrentDB
 {
     public class KurrentDBEventPersistence : IEventPersistence
     {
+        private const int MaxAppendAttempts = 5;
+        private static readonly TimeSpan AppendDeadline = TimeSpan.FromSeconds(30);
+        private readonly Func<string, StreamState, EventData[], CancellationToken, Task> _append;
         private readonly ILog _log;
         private readonly KurrentDBClient _client;
 
@@ -48,9 +52,22 @@ namespace EventFlow.EventStores.KurrentDB
         }
 
         public KurrentDBEventPersistence(ILog log, KurrentDBClient client)
+            : this(log, client, null)
+        {
+        }
+
+        // Internal transport seam allows tests to reproduce a lost acknowledgement
+        // after a real server commit without changing the public registration API.
+        internal KurrentDBEventPersistence(ILog log, KurrentDBClient client,
+            Func<string, StreamState, EventData[], CancellationToken, Task> append)
         {
             _log = log;
             _client = client;
+            _append = append ?? ((stream, expectedState, events, token) => client.AppendToStreamAsync(
+                stream, expectedState, events,
+                deadline: AppendDeadline,
+                configureOperationOptions: options => options.ThrowOnAppendFailure = true,
+                cancellationToken: token));
         }
 
         public async Task<IReadOnlyCollection<ICommittedDomainEvent>> CommitEventsAsync(
@@ -79,12 +96,7 @@ namespace EventFlow.EventStores.KurrentDB
 
             try
             {
-                await _client.AppendToStreamAsync(
-                    id.Value,
-                    expectedState,
-                    events,
-                    configureOperationOptions: options => options.ThrowOnAppendFailure = true,
-                    cancellationToken: cancellationToken).ConfigureAwait(false);
+                await AppendWithRetryAsync(id.Value, expectedState, events, cancellationToken).ConfigureAwait(false);
             }
             catch (WrongExpectedVersionException e)
             {
@@ -101,6 +113,31 @@ namespace EventFlow.EventStores.KurrentDB
                 Data = e.SerializedData,
                 Metadata = e.SerializedMetadata
             }).ToList();
+        }
+
+        private async Task AppendWithRetryAsync(string stream, StreamState expectedState,
+            EventData[] events, CancellationToken cancellationToken)
+        {
+            // A deadline does not establish whether the server committed the write.
+            // Retain the exact batch, storage IDs and expected revision on every retry.
+            // IDs are fresh again on a separate CommitEventsAsync call, so rival
+            // commands at the same aggregate sequence are still concurrency conflicts.
+            for (var attempt = 1; ; attempt++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    await _append(stream, expectedState, events, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+                catch (RpcException exception) when (exception.StatusCode == StatusCode.DeadlineExceeded
+                    && attempt < MaxAppendAttempts && !cancellationToken.IsCancellationRequested)
+                {
+                    _log.Warning("Append to stream '{0}' timed out on attempt {1}/{2}; retrying the identical batch because the outcome is unknown",
+                        stream, attempt, MaxAppendAttempts);
+                    await Task.Delay(TimeSpan.FromMilliseconds(50 * attempt), cancellationToken).ConfigureAwait(false);
+                }
+            }
         }
 
         public async Task<IReadOnlyCollection<ICommittedDomainEvent>> LoadCommittedEventsAsync(
